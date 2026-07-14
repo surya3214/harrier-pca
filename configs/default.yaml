@@ -1,0 +1,31 @@
+# Harrier PCA → mMiniLM distillation defaults
+bundle_dir: offline_bundle
+
+teacher_repo: microsoft/harrier-oss-v1-0.6b
+student_repo: nreimers/mMiniLMv2-L12-H384-distilled-from-XLMR-Large
+
+pca_dim: 384
+pca_fit_size: 50000
+eval_mse_size: 2000
+
+# Per-source unique-text caps (before global dedup)
+caps:
+  all_nli: 100000
+  gooaq: 100000
+  natural_questions: 100000
+  msmarco: 100000
+
+teacher_encode_batch_size: 256
+train_batch_size: 128
+learning_rate: 1.0e-4
+num_train_epochs: 1
+warmup_steps: 0.1
+seed: 12
+
+nanobeir_datasets:
+  - msmarco
+  - nfcorpus
+  - nq
+
+hub_model_id: surya3214/mminilm-h384-distilled-harrier-pca
+hub_pca_dataset_id: surya3214/harrier-pca-384-artifacts

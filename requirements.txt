@@ -1,0 +1,10 @@
+# Online download + offline GPU training
+sentence-transformers[train]>=5.0
+datasets>=2.19.0
+accelerate>=0.26.0
+scikit-learn>=1.3.0
+huggingface_hub>=0.24.0
+PyYAML>=6.0
+numpy>=1.24.0
+torch>=2.1.0
+transformers>=4.41.0
