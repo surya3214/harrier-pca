@@ -173,6 +173,10 @@ def main() -> None:
             model_name="mMiniLMv2-L12-H384 distilled from harrier-oss-v1-0.6b via PCA-384",
         ),
     )
+    max_seq_length = cfg.get("max_seq_length")
+    if max_seq_length is not None:
+        student.max_seq_length = int(max_seq_length)
+        logger.info("Set student.max_seq_length=%s", max_seq_length)
     if not any(isinstance(m, Normalize) for m in student):
         student.append(Normalize())
         logger.info("Appended Normalize() to student")
