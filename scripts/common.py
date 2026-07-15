@@ -209,17 +209,29 @@ def save_mse_datasets(
         raise ValueError(f"Too few non-empty texts after filtering: {len(texts)}")
 
     train_end = len(texts) - eval_mse_size
+    dim = int(np.asarray(reduced).shape[1])
+    from datasets import Features, Sequence, Value
+
+    features = Features(
+        {
+            "sentence": Value("string"),
+            # Fixed-length float32 vectors — avoids ambiguous Arrow list typing
+            "label": Sequence(Value("float32"), length=dim),
+        }
+    )
     train_ds = Dataset.from_dict(
         {
             "sentence": texts[:train_end],
             "label": np.asarray(reduced[:train_end], dtype=np.float32).tolist(),
-        }
+        },
+        features=features,
     )
     eval_ds = Dataset.from_dict(
         {
             "sentence": texts[train_end:],
             "label": np.asarray(reduced[train_end:], dtype=np.float32).tolist(),
-        }
+        },
+        features=features,
     )
     for path, ds in ((train_path, train_ds), (eval_path, eval_ds)):
         if path.exists():
