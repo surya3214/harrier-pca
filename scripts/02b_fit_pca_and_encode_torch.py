@@ -38,6 +38,7 @@ from common import limit_blas_threads  # noqa: E402
 limit_blas_threads(1)
 
 from common import (  # noqa: E402
+    assert_finite_embeddings,
     bundle_paths,
     encode_with_prompts,
     ensure_dirs,
@@ -209,6 +210,7 @@ def main() -> None:
         t0 = time.time()
         full_emb = encode_with_prompts(teacher, texts, prompt_names, batch_size)
         logger.info("Encode finished in %.1fs | shape=%s", time.time() - t0, full_emb.shape)
+        assert_finite_embeddings(full_emb, "teacher_embeddings")
 
         logger.info("Saving encode checkpoint → %s", paths["teacher_emb"])
         np.save(paths["teacher_emb"], full_emb)
@@ -248,7 +250,9 @@ def main() -> None:
 
     logger.info("Transforming full corpus + L2-normalize ...")
     reduced = transform_pca(full_emb, components, mean).astype(np.float32)
+    assert_finite_embeddings(reduced, "pca_transformed")
     reduced = l2_normalize(reduced).astype(np.float32)
+    assert_finite_embeddings(reduced, "pca_l2_normalized")
 
     train_n, eval_n = save_mse_datasets(
         texts, reduced, eval_mse_size, paths["train_mse"], paths["eval_mse"]
