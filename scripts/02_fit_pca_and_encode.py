@@ -177,7 +177,15 @@ def main() -> None:
             "eval_mse_rows": eval_n,
             "smoke_test": smoke,
             "max_seq_length": max_seq_length,
+            "teacher_pca_st": str(paths["teacher_pca"]),
         },
+    )
+    logger.info("Exporting PCA teacher SentenceTransformer → %s", paths["teacher_pca"])
+    export_pca_teacher_st(
+        teacher_path=paths["teacher"],
+        pca_npz_path=paths["pca"],
+        output_path=paths["teacher_pca"],
+        max_seq_length=int(max_seq_length) if max_seq_length is not None else None,
     )
     logger.info("Done. Next: scripts/03_train_student.py")
 
