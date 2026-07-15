@@ -161,9 +161,15 @@ def main() -> None:
     reduced = l2_normalize(reduced).astype(np.float32)
 
     train_n, eval_n = save_mse_datasets(
-        texts, reduced, eval_mse_size, paths["train_mse"], paths["eval_mse"]
+        texts,
+        reduced,
+        eval_mse_size,
+        paths["train_mse"],
+        paths["eval_mse"],
+        prompt_names=prompt_names,
+        prompts_path=paths["prompts"],
     )
-    logger.info("Saved train_mse=%s eval_mse=%s", f"{train_n:,}", f"{eval_n:,}")
+    logger.info("Saved train_mse=%s eval_mse=%s (+ prompt_name, prompts.json)", f"{train_n:,}", f"{eval_n:,}")
 
     write_json(
         paths["artifacts"] / "pca_encode_stats.json",
