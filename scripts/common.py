@@ -47,6 +47,7 @@ def bundle_paths(bundle_dir: Path) -> dict[str, Path]:
         "nanobeir": bundle_dir / "datasets" / "NanoBEIR-en",
         "artifacts": bundle_dir / "artifacts",
         "pca": bundle_dir / "artifacts" / "pca_384.npz",
+        "teacher_emb": bundle_dir / "artifacts" / "teacher_emb_1024.npy",
         "train_mse": bundle_dir / "artifacts" / "train_mse",
         "eval_mse": bundle_dir / "artifacts" / "eval_mse",
         "outputs": bundle_dir / "outputs",
@@ -97,9 +98,78 @@ def set_offline_env() -> None:
     os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 
+def limit_blas_threads(n: int = 1) -> None:
+    """Avoid PyTorch + OpenMP/MKL deadlocks (e.g. sklearn PCA hang after GPU encode)."""
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ.setdefault(key, str(n))
+
+
 def l2_normalize(vectors):
     import numpy as np
 
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     norms = np.maximum(norms, 1e-12)
     return vectors / norms
+
+
+def encode_with_prompts(model, texts: list[str], prompt_names: list[str], batch_size: int):
+    """Encode texts grouped by prompt_name (Harrier requires task prompts)."""
+    from collections import defaultdict
+
+    import numpy as np
+
+    logger = logging.getLogger("encode")
+    groups: dict[str, list[int]] = defaultdict(list)
+    for i, name in enumerate(prompt_names):
+        groups[name or ""].append(i)
+
+    dim = model.get_embedding_dimension()
+    out = np.zeros((len(texts), dim), dtype=np.float32)
+
+    for prompt_name, indices in groups.items():
+        batch_texts = [texts[i] for i in indices]
+        kwargs = {
+            "batch_size": batch_size,
+            "convert_to_numpy": True,
+            "show_progress_bar": True,
+        }
+        if prompt_name:
+            kwargs["prompt_name"] = prompt_name
+            logger.info("Encoding %s texts with prompt_name=%r", f"{len(batch_texts):,}", prompt_name)
+        else:
+            logger.info("Encoding %s texts with no prompt (documents)", f"{len(batch_texts):,}")
+        emb = model.encode(batch_texts, **kwargs)
+        out[indices] = emb.astype(np.float32, copy=False)
+    return out
+
+
+def save_mse_datasets(
+    texts: list[str],
+    reduced,
+    eval_mse_size: int,
+    train_path,
+    eval_path,
+) -> tuple[int, int]:
+    """Split reduced embeddings into train/eval HF datasets and save_to_disk."""
+    import shutil
+
+    from datasets import Dataset
+
+    train_end = len(texts) - eval_mse_size
+    train_ds = Dataset.from_dict(
+        {"sentence": texts[:train_end], "label": reduced[:train_end].tolist()}
+    )
+    eval_ds = Dataset.from_dict(
+        {"sentence": texts[train_end:], "label": reduced[train_end:].tolist()}
+    )
+    for path, ds in ((train_path, train_ds), (eval_path, eval_ds)):
+        if path.exists():
+            shutil.rmtree(path)
+        ds.save_to_disk(str(path))
+    return len(train_ds), len(eval_ds)

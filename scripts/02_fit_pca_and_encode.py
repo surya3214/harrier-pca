@@ -1,31 +1,42 @@
 #!/usr/bin/env python3
-"""GPU OFFLINE: fit PCA (1024→384) on Harrier embeddings and write MSE distillation labels.
+"""GPU OFFLINE: fit PCA (1024→384) with sklearn and write MSE distillation labels.
 
-Requires the offline_bundle from 01_download_bundle.py. No internet.
+NOTE: After CUDA encode, sklearn PCA can hang due to OpenMP/MKL + PyTorch thread
+deadlocks. Prefer scripts/02b_fit_pca_and_encode_torch.py on H100 infra.
+
+This script still sets BLAS thread caps and logs around pca.fit for diagnostics.
 
 Usage:
   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
-  python scripts/02_fit_pca_and_encode.py --bundle-dir /path/to/offline_bundle
-
-  SMOKE_TEST=1 python scripts/02_fit_pca_and_encode.py   # tiny slice
+  # Prefer:
+  python scripts/02b_fit_pca_and_encode_torch.py --bundle-dir offline_bundle
+  # Fallback:
+  python scripts/02_fit_pca_and_encode.py --bundle-dir offline_bundle
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import limit_blas_threads  # noqa: E402
+
+limit_blas_threads(1)
 
 from common import (  # noqa: E402
     bundle_paths,
+    encode_with_prompts,
     ensure_dirs,
     l2_normalize,
     load_config,
     resolve_bundle_dir,
+    save_mse_datasets,
     set_offline_env,
     setup_logging,
     write_json,
@@ -34,38 +45,8 @@ from common import (  # noqa: E402
 logger = logging.getLogger("pca-encode")
 
 
-def encode_with_prompts(model, texts: list[str], prompt_names: list[str], batch_size: int):
-    """Encode texts grouped by prompt_name (Harrier requires task prompts)."""
-    from collections import defaultdict
-
-    import numpy as np
-
-    groups: dict[str, list[int]] = defaultdict(list)
-    for i, name in enumerate(prompt_names):
-        groups[name or ""].append(i)
-
-    dim = model.get_embedding_dimension()
-    out = np.zeros((len(texts), dim), dtype=np.float32)
-
-    for prompt_name, indices in groups.items():
-        batch_texts = [texts[i] for i in indices]
-        kwargs = {
-            "batch_size": batch_size,
-            "convert_to_numpy": True,
-            "show_progress_bar": True,
-        }
-        if prompt_name:
-            kwargs["prompt_name"] = prompt_name
-            logger.info("Encoding %s texts with prompt_name=%r", f"{len(batch_texts):,}", prompt_name)
-        else:
-            logger.info("Encoding %s texts with no prompt (documents)", f"{len(batch_texts):,}")
-        emb = model.encode(batch_texts, **kwargs)
-        out[indices] = emb.astype(np.float32, copy=False)
-    return out
-
-
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fit PCA on Harrier and encode MSE labels")
+    p = argparse.ArgumentParser(description="Fit PCA on Harrier and encode MSE labels (sklearn)")
     p.add_argument("--config", default=None)
     p.add_argument("--bundle-dir", default=None)
     return p.parse_args()
@@ -74,6 +55,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     set_offline_env()
+    limit_blas_threads(1)
     cfg = load_config(args.config)
     bundle_dir = resolve_bundle_dir(cfg, args.bundle_dir)
     paths = bundle_paths(bundle_dir)
@@ -85,6 +67,7 @@ def main() -> None:
     pca_fit_size = 64 if smoke else int(cfg["pca_fit_size"])
     eval_mse_size = 16 if smoke else int(cfg["eval_mse_size"])
     batch_size = 8 if smoke else int(cfg["teacher_encode_batch_size"])
+    max_seq_length = cfg.get("max_seq_length")
 
     if not paths["teacher"].exists():
         raise SystemExit(f"Teacher model missing: {paths['teacher']} (run 01_download_bundle.py first)")
@@ -92,7 +75,8 @@ def main() -> None:
         raise SystemExit(f"Corpus missing: {paths['corpus']} (run 01_download_bundle.py first)")
 
     import numpy as np
-    from datasets import Dataset, load_from_disk
+    import torch
+    from datasets import load_from_disk
     from sentence_transformers import SentenceTransformer
     from sklearn.decomposition import PCA
 
@@ -114,22 +98,51 @@ def main() -> None:
 
     logger.info("Loading teacher from %s", paths["teacher"])
     teacher = SentenceTransformer(str(paths["teacher"]), model_kwargs={"dtype": "auto"})
+    if max_seq_length is not None:
+        teacher.max_seq_length = int(max_seq_length)
+        logger.info("Set teacher.max_seq_length=%s", max_seq_length)
+
     teacher_dim = teacher.get_embedding_dimension()
     logger.info("Teacher embedding dim=%s → PCA dim=%s", teacher_dim, pca_dim)
     if teacher_dim < pca_dim:
         raise SystemExit(f"Teacher dim {teacher_dim} < pca_dim {pca_dim}")
 
-    # --- Fit PCA ---
-    fit_texts = texts[:pca_fit_size]
-    fit_prompts = prompt_names[:pca_fit_size]
-    logger.info("Encoding %s texts for PCA fit", f"{len(fit_texts):,}")
-    fit_emb = encode_with_prompts(teacher, fit_texts, fit_prompts, batch_size)
+    # Encode full corpus once (same as 02b), then free teacher before sklearn PCA
+    logger.info("Encoding FULL corpus once (%s texts) ...", f"{len(texts):,}")
+    t0 = time.time()
+    full_emb = encode_with_prompts(teacher, texts, prompt_names, batch_size)
+    logger.info("Encode finished in %.1fs | shape=%s", time.time() - t0, full_emb.shape)
+    np.save(paths["teacher_emb"], full_emb)
 
-    logger.info("Fitting PCA(%s)", pca_dim)
-    pca = PCA(n_components=pca_dim, random_state=int(cfg.get("seed", 12)))
+    logger.info("Releasing teacher before sklearn PCA (avoids OpenMP hang) ...")
+    del teacher
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    fit_emb = full_emb[:pca_fit_size]
+    logger.info(
+        "Fitting sklearn PCA(%s) on %s rows (svd_solver=randomized) ...",
+        pca_dim,
+        f"{len(fit_emb):,}",
+    )
+    for h in logging.root.handlers:
+        h.flush()
+
+    t0 = time.time()
+    pca = PCA(
+        n_components=pca_dim,
+        svd_solver="randomized",
+        random_state=int(cfg.get("seed", 12)),
+    )
     pca.fit(fit_emb)
     explained = float(pca.explained_variance_ratio_.sum())
-    logger.info("PCA cumulative explained variance (top %s): %.4f", pca_dim, explained)
+    logger.info(
+        "PCA done in %.1fs | cumulative explained variance (top %s): %.4f",
+        time.time() - t0,
+        pca_dim,
+        explained,
+    )
 
     np.savez(
         paths["pca"],
@@ -138,47 +151,31 @@ def main() -> None:
         explained_variance_ratio_=pca.explained_variance_ratio_.astype(np.float32),
         teacher_dim=np.array([teacher_dim], dtype=np.int32),
         pca_dim=np.array([pca_dim], dtype=np.int32),
+        method=np.array(["sklearn.PCA.randomized"]),
     )
     logger.info("Saved PCA to %s", paths["pca"])
 
-    # --- Encode full corpus, transform, L2-normalize ---
-    logger.info("Encoding full corpus (%s) with teacher", f"{len(texts):,}")
-    full_emb = encode_with_prompts(teacher, texts, prompt_names, batch_size)
+    logger.info("Transforming full corpus + L2-normalize ...")
     reduced = pca.transform(full_emb).astype(np.float32)
     reduced = l2_normalize(reduced).astype(np.float32)
 
-    # Hold out last eval_mse_size rows for MSE eval; rest for train
-    train_end = len(texts) - eval_mse_size
-    train_sentences = texts[:train_end]
-    train_labels = reduced[:train_end]
-    eval_sentences = texts[train_end:]
-    eval_labels = reduced[train_end:]
-
-    train_ds = Dataset.from_dict(
-        {"sentence": train_sentences, "label": train_labels.tolist()}
+    train_n, eval_n = save_mse_datasets(
+        texts, reduced, eval_mse_size, paths["train_mse"], paths["eval_mse"]
     )
-    eval_ds = Dataset.from_dict(
-        {"sentence": eval_sentences, "label": eval_labels.tolist()}
-    )
-
-    for path, ds in ((paths["train_mse"], train_ds), (paths["eval_mse"], eval_ds)):
-        if path.exists():
-            import shutil
-
-            shutil.rmtree(path)
-        ds.save_to_disk(str(path))
-        logger.info("Saved %s (%s rows)", path, f"{len(ds):,}")
+    logger.info("Saved train_mse=%s eval_mse=%s", f"{train_n:,}", f"{eval_n:,}")
 
     write_json(
         paths["artifacts"] / "pca_encode_stats.json",
         {
+            "method": "sklearn.PCA.randomized",
             "teacher_dim": teacher_dim,
             "pca_dim": pca_dim,
             "pca_fit_size": pca_fit_size,
             "explained_variance_sum": explained,
-            "train_rows": len(train_ds),
-            "eval_mse_rows": len(eval_ds),
+            "train_rows": train_n,
+            "eval_mse_rows": eval_n,
             "smoke_test": smoke,
+            "max_seq_length": max_seq_length,
         },
     )
     logger.info("Done. Next: scripts/03_train_student.py")

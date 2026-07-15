@@ -46,20 +46,35 @@ Copy the entire `offline_bundle/` directory to the air-gapped GPU host (USB / sc
 
 ### 2. Offline H100 — PCA + teacher labels
 
+**Prefer the torch script** (avoids sklearn/OpenMP hangs after CUDA encode):
+
 ```bash
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 
 # Optional smoke test
-SMOKE_TEST=1 python scripts/02_fit_pca_and_encode.py --bundle-dir offline_bundle
+SMOKE_TEST=1 python scripts/02b_fit_pca_and_encode_torch.py --bundle-dir offline_bundle
 
+python scripts/02b_fit_pca_and_encode_torch.py --bundle-dir offline_bundle
+
+# If encode already finished and teacher_emb_1024.npy exists:
+# python scripts/02b_fit_pca_and_encode_torch.py --bundle-dir offline_bundle --skip-encode
+```
+
+Fallback (sklearn, also hardened with thread caps + free teacher before `fit`):
+
+```bash
 python scripts/02_fit_pca_and_encode.py --bundle-dir offline_bundle
 ```
+
+Both scripts write the same artifacts (`pca_384.npz`, `train_mse/`, `eval_mse/`) for `03_train_student.py`.
 
 Harrier prompts used while encoding:
 
 - STS / NLI text → `sts_query`
 - Retrieval queries → `web_search_query`
 - Passages / answers → no prompt
+
+Teacher `max_seq_length` defaults to **512** (see `configs/default.yaml`) so PCA targets match the student window.
 
 ### 3. Offline H100 — distill student
 
@@ -110,6 +125,7 @@ Eval: STS-B validation + NanoBEIR (`msmarco`, `nfcorpus`, `nq`).
 | Script | Machine | Purpose |
 |---|---|---|
 | [`scripts/01_download_bundle.py`](scripts/01_download_bundle.py) | Online | Models + capped corpora + eval sets |
-| [`scripts/02_fit_pca_and_encode.py`](scripts/02_fit_pca_and_encode.py) | GPU | PCA 1024→384 + MSE label cache |
+| [`scripts/02b_fit_pca_and_encode_torch.py`](scripts/02b_fit_pca_and_encode_torch.py) | GPU | **Preferred** — `torch.pca_lowrank` PCA + MSE labels |
+| [`scripts/02_fit_pca_and_encode.py`](scripts/02_fit_pca_and_encode.py) | GPU | Fallback sklearn PCA (thread-capped) |
 | [`scripts/03_train_student.py`](scripts/03_train_student.py) | GPU | MSE distillation + STS/NanoBEIR |
 | [`scripts/04_upload_results.py`](scripts/04_upload_results.py) | Online | Push student + PCA to Hub |
