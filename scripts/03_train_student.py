@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     bundle_paths,
     ensure_dirs,
+    label_stats,
     load_config,
     resolve_bundle_dir,
     set_offline_env,
@@ -187,13 +188,50 @@ def main() -> None:
         train_dataset = train_dataset.select(range(min(64, len(train_dataset))))
         eval_dataset = eval_dataset.select(range(min(16, len(eval_dataset))))
 
+    # Drop empty sentences (Normalize + MSE can NaN on degenerate inputs)
+    def _nonempty(example):
+        t = example["sentence"]
+        return isinstance(t, str) and bool(t.strip())
+
+    before = len(train_dataset)
+    train_dataset = train_dataset.filter(_nonempty)
+    eval_dataset = eval_dataset.filter(_nonempty)
+    if len(train_dataset) < before:
+        logger.info("Filtered empty train sentences: %s → %s", before, len(train_dataset))
+
     label0 = train_dataset[0]["label"]
     label_dim = len(label0) if isinstance(label0, list) else int(label0.shape[-1])
     student_dim = student.get_embedding_dimension()
     if label_dim != student_dim:
         raise SystemExit(
             f"Label dim {label_dim} != student dim {student_dim}. "
-            "Re-run 02_fit_pca_and_encode.py with matching pca_dim."
+            "Re-run 02b_fit_pca_and_encode_torch.py with matching pca_dim."
+        )
+
+    # Preflight: NaN labels are a common cause of step-2 grad_norm=nan / loss logged as 0
+    import numpy as np
+
+    sample_n = min(2048, len(train_dataset))
+    sample_labels = np.asarray(train_dataset.select(range(sample_n))["label"], dtype=np.float32)
+    stats = label_stats(sample_labels)
+    logger.info("Label preflight (n=%s): %s", sample_n, stats)
+    # Expected healthy first-step MSE ≈ 2/dim ≈ 0.0052 for near-orthogonal unit vectors
+    logger.info(
+        "Healthy first-step MSE for unit 384-d targets is ~%.6f (2/dim); "
+        "logged loss=0 with grad_norm=nan usually means real NaN (Trainer filters NaN logs).",
+        2.0 / student_dim,
+    )
+    if not stats["finite"]:
+        raise SystemExit(
+            f"Non-finite labels in train_mse (nan={stats['nan']}, inf={stats['inf']}). "
+            "Re-run 02b and check teacher embeddings."
+        )
+    if stats["norm_min"] < 0.5 or stats["norm_max"] > 1.5:
+        logger.warning(
+            "Label L2 norms not near 1.0 (min=%.4f max=%.4f). "
+            "Student uses Normalize(); mismatched scales can destabilize MSE.",
+            stats["norm_min"],
+            stats["norm_max"],
         )
 
     loss = MSELoss(model=student)
@@ -218,6 +256,18 @@ def main() -> None:
     ensure_dirs(output_dir)
 
     train_bs = 8 if smoke else int(cfg["train_batch_size"])
+    use_bf16 = bool(cfg.get("bf16", False)) and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16 = bool(cfg.get("fp16", False)) and torch.cuda.is_available() and not use_bf16
+    if use_bf16 or use_fp16:
+        logger.warning(
+            "Mixed precision enabled (bf16=%s fp16=%s). If you see grad_norm=nan / loss=0, "
+            "set bf16: false and fp16: false in configs/default.yaml",
+            use_bf16,
+            use_fp16,
+        )
+    else:
+        logger.info("Training in fp32 (recommended for MSE+Normalize on mMiniLM)")
+
     args_train = SentenceTransformerTrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=1 if smoke else float(cfg["num_train_epochs"]),
@@ -227,8 +277,9 @@ def main() -> None:
         learning_rate=float(cfg["learning_rate"]),
         weight_decay=0.01,
         warmup_steps=float(cfg["warmup_steps"]),
-        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
+        max_grad_norm=float(cfg.get("max_grad_norm", 1.0)),
+        bf16=use_bf16,
+        fp16=use_fp16,
         eval_strategy="steps",
         eval_steps=1.0 if smoke else 0.1,
         save_strategy="steps",
@@ -236,12 +287,15 @@ def main() -> None:
         save_total_limit=2,
         logging_steps=1 if smoke else 0.01,
         logging_first_step=True,
+        # Default True hides NaN loss as 0 — keep False so instability is visible
+        logging_nan_inf_filter=False,
         load_best_model_at_end=not smoke,
         metric_for_best_model=metric_key,
         greater_is_better=True,
         report_to="none",
         run_name="mminilm-harrier-pca-mse",
         seed=int(cfg.get("seed", 12)),
+        remove_unused_columns=False,
     )
 
     trainer = SentenceTransformerTrainer(
