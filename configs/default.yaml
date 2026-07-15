@@ -27,6 +27,8 @@ max_grad_norm: 1.0
 # fp32 is safer for MSE+Normalize distillation on this student; set true on H100 if stable
 bf16: false
 fp16: false
+# Training logs for TensorBoard (view with: tensorboard --logdir offline_bundle/logs/tensorboard)
+report_to: tensorboard
 seed: 12
 
 nanobeir_datasets:
@@ -35,4 +37,5 @@ nanobeir_datasets:
   - nq
 
 hub_model_id: surya3214/mminilm-h384-distilled-harrier-pca
+hub_teacher_pca_id: surya3214/harrier-pca-384
 hub_pca_dataset_id: surya3214/harrier-pca-384-artifacts

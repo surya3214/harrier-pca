@@ -268,6 +268,23 @@ def main() -> None:
     else:
         logger.info("Training in fp32 (recommended for MSE+Normalize on mMiniLM)")
 
+    report_to = cfg.get("report_to", "tensorboard")
+    if isinstance(report_to, str):
+        report_to_list = ["none"] if report_to in (None, "", "none") else [report_to]
+    else:
+        report_to_list = list(report_to) if report_to else ["none"]
+    if smoke:
+        report_to_list = ["none"]
+
+    tb_dir = paths["tensorboard"] / "mminilm-harrier-pca-mse"
+    ensure_dirs(tb_dir)
+    if "tensorboard" in report_to_list:
+        logger.info(
+            "TensorBoard logging → %s  |  view: tensorboard --logdir %s --port 6006",
+            tb_dir,
+            paths["tensorboard"],
+        )
+
     args_train = SentenceTransformerTrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=1 if smoke else float(cfg["num_train_epochs"]),
@@ -292,7 +309,8 @@ def main() -> None:
         load_best_model_at_end=not smoke,
         metric_for_best_model=metric_key,
         greater_is_better=True,
-        report_to="none",
+        report_to=report_to_list,
+        logging_dir=str(tb_dir),
         run_name="mminilm-harrier-pca-mse",
         seed=int(cfg.get("seed", 12)),
         remove_unused_columns=False,

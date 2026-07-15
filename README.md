@@ -29,7 +29,9 @@ offline_bundle/
   artifacts/pca_384.npz
   artifacts/train_mse/      # sentence, label[384]
   artifacts/eval_mse/
+  outputs/teacher-pca-384/  # Harrier+PCA SentenceTransformer (384-d)
   outputs/student-final/    # loadable SentenceTransformer
+  logs/tensorboard/         # TensorBoard event files
   logs/
   MANIFEST.json
 ```
@@ -67,6 +69,13 @@ python scripts/02_fit_pca_and_encode.py --bundle-dir offline_bundle
 ```
 
 Both scripts write the same artifacts (`pca_384.npz`, `train_mse/`, `eval_mse/`) for `03_train_student.py`.
+`02b` also exports `outputs/teacher-pca-384/` (Harrier + PCA as a SentenceTransformer).
+
+If you already have `pca_384.npz` and only need the ST export:
+
+```bash
+python scripts/05_export_pca_teacher.py --bundle-dir offline_bundle
+```
 
 Harrier prompts used while encoding:
 
@@ -89,11 +98,36 @@ If training logs `loss≈0.005` then `grad_norm=nan` / `loss=0`, that first loss
 
 Saves a standard SentenceTransformer folder at `offline_bundle/outputs/student-final/`.
 
-Load later (any machine, no Hub needed):
+#### TensorBoard
+
+Training writes events under `offline_bundle/logs/tensorboard/` (`report_to: tensorboard` in config).
+
+On the GPU host (or after copying `logs/tensorboard` to a machine with a browser):
+
+```bash
+pip install tensorboard   # if not already from requirements.txt
+tensorboard --logdir offline_bundle/logs/tensorboard --port 6006 --bind_all
+```
+
+Then open `http://<host>:6006` (SSH tunnel if needed: `ssh -L 6006:localhost:6006 user@gpu-host`).
+
+Disable with `report_to: none` in `configs/default.yaml`.
+
+Load student later (any machine, no Hub needed):
 
 ```python
 from sentence_transformers import SentenceTransformer
 model = SentenceTransformer("offline_bundle/outputs/student-final/")
+```
+
+Load PCA teacher (384-d Harrier) for custom eval:
+
+```python
+from sentence_transformers import SentenceTransformer
+teacher = SentenceTransformer("offline_bundle/outputs/teacher-pca-384/")
+# same prompts as Harrier, e.g. prompt_name="web_search_query" / "sts_query"
+emb = teacher.encode(["example query"], prompt_name="sts_query")
+print(emb.shape)  # (1, 384)
 ```
 
 ### 4. Online — upload
@@ -108,7 +142,8 @@ python scripts/04_upload_results.py --bundle-dir offline_bundle
 
 Default Hub targets (override in config or CLI):
 
-- Model: `surya3214/mminilm-h384-distilled-harrier-pca`
+- Student: `surya3214/mminilm-h384-distilled-harrier-pca`
+- PCA teacher ST: `surya3214/harrier-pca-384`
 - PCA artifacts dataset: `surya3214/harrier-pca-384-artifacts`
 
 ## Training data (capped)
@@ -127,7 +162,8 @@ Eval: STS-B validation + NanoBEIR (`msmarco`, `nfcorpus`, `nq`).
 | Script | Machine | Purpose |
 |---|---|---|
 | [`scripts/01_download_bundle.py`](scripts/01_download_bundle.py) | Online | Models + capped corpora + eval sets |
-| [`scripts/02b_fit_pca_and_encode_torch.py`](scripts/02b_fit_pca_and_encode_torch.py) | GPU | **Preferred** — `torch.pca_lowrank` PCA + MSE labels |
+| [`scripts/02b_fit_pca_and_encode_torch.py`](scripts/02b_fit_pca_and_encode_torch.py) | GPU | **Preferred** — `torch.pca_lowrank` PCA + MSE labels + PCA teacher ST |
 | [`scripts/02_fit_pca_and_encode.py`](scripts/02_fit_pca_and_encode.py) | GPU | Fallback sklearn PCA (thread-capped) |
-| [`scripts/03_train_student.py`](scripts/03_train_student.py) | GPU | MSE distillation + STS/NanoBEIR |
-| [`scripts/04_upload_results.py`](scripts/04_upload_results.py) | Online | Push student + PCA to Hub |
+| [`scripts/05_export_pca_teacher.py`](scripts/05_export_pca_teacher.py) | GPU | Export Harrier+PCA as SentenceTransformer only |
+| [`scripts/03_train_student.py`](scripts/03_train_student.py) | GPU | MSE distillation + STS/NanoBEIR + TensorBoard |
+| [`scripts/04_upload_results.py`](scripts/04_upload_results.py) | Online | Push student + PCA teacher + artifacts to Hub |

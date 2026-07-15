@@ -52,6 +52,8 @@ def bundle_paths(bundle_dir: Path) -> dict[str, Path]:
         "eval_mse": bundle_dir / "artifacts" / "eval_mse",
         "outputs": bundle_dir / "outputs",
         "student_final": bundle_dir / "outputs" / "student-final",
+        "teacher_pca": bundle_dir / "outputs" / "teacher-pca-384",
+        "tensorboard": bundle_dir / "logs" / "tensorboard",
         "logs": bundle_dir / "logs",
         "manifest": bundle_dir / "MANIFEST.json",
     }
@@ -224,3 +226,73 @@ def save_mse_datasets(
             shutil.rmtree(path)
         ds.save_to_disk(str(path))
     return len(train_ds), len(eval_ds)
+
+
+def export_pca_teacher_st(
+    teacher_path,
+    pca_npz_path,
+    output_path,
+    max_seq_length: int | None = None,
+) -> str:
+    """Build Harrier + PCA Dense(+Normalize) as a loadable SentenceTransformer.
+
+    PCA was fit on teacher.encode() outputs (already L2-normalized for Harrier).
+    Pipeline: existing modules (… → Normalize) → Dense(PCA) → Normalize(384).
+
+    Dense implements y = (x - mean) @ components_.T via
+    weight=components_, bias=-mean @ components_.T.
+    """
+    import shutil
+    from pathlib import Path
+
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers.sentence_transformer.modules import Dense, Normalize
+
+    teacher_path = Path(teacher_path)
+    pca_npz_path = Path(pca_npz_path)
+    output_path = Path(output_path)
+
+    if not teacher_path.exists():
+        raise FileNotFoundError(f"Teacher model missing: {teacher_path}")
+    if not pca_npz_path.exists():
+        raise FileNotFoundError(f"PCA file missing: {pca_npz_path}")
+
+    pca = np.load(pca_npz_path)
+    components = np.asarray(pca["components_"], dtype=np.float32)  # (pca_dim, teacher_dim)
+    mean = np.asarray(pca["mean_"], dtype=np.float32)  # (teacher_dim,)
+    pca_dim, teacher_dim = components.shape
+
+    model = SentenceTransformer(str(teacher_path), model_kwargs={"dtype": "auto"})
+    if max_seq_length is not None:
+        model.max_seq_length = int(max_seq_length)
+
+    in_dim = model.get_embedding_dimension()
+    if in_dim != teacher_dim:
+        raise ValueError(
+            f"Teacher dim {in_dim} != PCA teacher_dim {teacher_dim}. Re-fit PCA with this teacher."
+        )
+
+    weight = torch.from_numpy(components)  # (pca_dim, teacher_dim)
+    bias = torch.from_numpy(-(mean @ components.T))  # (pca_dim,)
+    dense = Dense(
+        in_features=teacher_dim,
+        out_features=pca_dim,
+        bias=True,
+        activation_function=nn.Identity(),
+        init_weight=weight,
+        init_bias=bias,
+    )
+    for p in dense.parameters():
+        p.requires_grad = False
+
+    model.append(dense)
+    model.append(Normalize())
+
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(str(output_path))
+    return str(output_path)
