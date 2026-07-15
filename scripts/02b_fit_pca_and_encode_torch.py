@@ -3,7 +3,8 @@
 
 Same bundle contract as 02_fit_pca_and_encode.py:
   - reads datasets/corpus (text, prompt_name)
-  - writes artifacts/pca_384.npz, train_mse/, eval_mse/
+  - writes artifacts/pca_384.npz, train_mse/, eval_mse/, prompts.json
+  - MSE datasets include prompt_name (empty → document) for student training
 
 Difference vs 02:
   1. Encode full corpus once → save teacher_emb_1024.npy checkpoint
@@ -261,9 +262,15 @@ def main() -> None:
     assert_finite_embeddings(reduced, "pca_l2_normalized")
 
     train_n, eval_n = save_mse_datasets(
-        texts, reduced, eval_mse_size, paths["train_mse"], paths["eval_mse"]
+        texts,
+        reduced,
+        eval_mse_size,
+        paths["train_mse"],
+        paths["eval_mse"],
+        prompt_names=prompt_names,
+        prompts_path=paths["prompts"],
     )
-    logger.info("Saved train_mse=%s eval_mse=%s", f"{train_n:,}", f"{eval_n:,}")
+    logger.info("Saved train_mse=%s eval_mse=%s (+ prompt_name, prompts.json)", f"{train_n:,}", f"{eval_n:,}")
 
     write_json(
         paths["artifacts"] / "pca_encode_stats.json",

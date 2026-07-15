@@ -16,6 +16,27 @@ PROMPTS = {
     "document": "",
 }
 
+# Hardcoded from microsoft/harrier-oss-v1-0.6b so offline hosts need not load the teacher.
+HARRIER_PROMPTS: dict[str, str] = {
+    "web_search_query": (
+        "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+    ),
+    "sts_query": "Instruct: Retrieve semantically similar text\nQuery: ",
+    "bitext_query": "Instruct: Retrieve parallel sentences\nQuery: ",
+    "document": "",  # empty / None prompt_name → document
+}
+
+DOCUMENT_PROMPT_NAME = "document"
+
+
+def normalize_prompt_name(name: str | None) -> str:
+    """Map empty/None teacher prompt_name to the document key used in MSE datasets."""
+    if name is None:
+        return DOCUMENT_PROMPT_NAME
+    if isinstance(name, str) and not name.strip():
+        return DOCUMENT_PROMPT_NAME
+    return str(name)
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -47,6 +68,7 @@ def bundle_paths(bundle_dir: Path) -> dict[str, Path]:
         "nanobeir": bundle_dir / "datasets" / "NanoBEIR-en",
         "artifacts": bundle_dir / "artifacts",
         "pca": bundle_dir / "artifacts" / "pca_384.npz",
+        "prompts": bundle_dir / "artifacts" / "prompts.json",
         "teacher_emb": bundle_dir / "artifacts" / "teacher_emb_1024.npy",
         "train_mse": bundle_dir / "artifacts" / "train_mse",
         "eval_mse": bundle_dir / "artifacts" / "eval_mse",
@@ -192,21 +214,36 @@ def save_mse_datasets(
     eval_mse_size: int,
     train_path,
     eval_path,
+    prompt_names: list[str],
+    prompts_path=None,
 ) -> tuple[int, int]:
-    """Split reduced embeddings into train/eval HF datasets and save_to_disk."""
+    """Split reduced embeddings into train/eval HF datasets and save_to_disk.
+
+    Persists ``prompt_name`` alongside each row (empty/None → ``document``) so
+    student training can apply the same Harrier instruction strings per split.
+    Also writes ``prompts.json`` (HARRIER_PROMPTS) next to the MSE artifacts.
+    """
     import shutil
 
     import numpy as np
     from datasets import Dataset
 
+    if len(prompt_names) != len(texts):
+        raise ValueError(
+            f"prompt_names length {len(prompt_names)} != texts length {len(texts)}"
+        )
+
     assert_finite_embeddings(reduced, "pca_reduced_labels")
-    # Drop empty texts (can destabilize Normalize grads)
+    # Drop empty texts (can destabilize Normalize grads) in lockstep with prompts/labels
     keep = [i for i, t in enumerate(texts) if isinstance(t, str) and t.strip()]
     if len(keep) < len(texts):
         texts = [texts[i] for i in keep]
+        prompt_names = [prompt_names[i] for i in keep]
         reduced = np.asarray(reduced, dtype=np.float32)[keep]
     if len(texts) <= eval_mse_size + 1:
         raise ValueError(f"Too few non-empty texts after filtering: {len(texts)}")
+
+    normalized_names = [normalize_prompt_name(n) for n in prompt_names]
 
     train_end = len(texts) - eval_mse_size
     dim = int(np.asarray(reduced).shape[1])
@@ -215,6 +252,7 @@ def save_mse_datasets(
     features = Features(
         {
             "sentence": Value("string"),
+            "prompt_name": Value("string"),
             # Fixed-length float32 vectors — avoids ambiguous Arrow list typing
             "label": Sequence(Value("float32"), length=dim),
         }
@@ -222,6 +260,7 @@ def save_mse_datasets(
     train_ds = Dataset.from_dict(
         {
             "sentence": texts[:train_end],
+            "prompt_name": normalized_names[:train_end],
             "label": np.asarray(reduced[:train_end], dtype=np.float32).tolist(),
         },
         features=features,
@@ -229,6 +268,7 @@ def save_mse_datasets(
     eval_ds = Dataset.from_dict(
         {
             "sentence": texts[train_end:],
+            "prompt_name": normalized_names[train_end:],
             "label": np.asarray(reduced[train_end:], dtype=np.float32).tolist(),
         },
         features=features,
@@ -237,6 +277,13 @@ def save_mse_datasets(
         if path.exists():
             shutil.rmtree(path)
         ds.save_to_disk(str(path))
+
+    out_prompts = Path(prompts_path) if prompts_path is not None else Path(train_path).parent / "prompts.json"
+    out_prompts.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_prompts, "w", encoding="utf-8") as f:
+        json.dump(HARRIER_PROMPTS, f, indent=2)
+        f.write("\n")
+
     return len(train_ds), len(eval_ds)
 
 

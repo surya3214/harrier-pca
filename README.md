@@ -68,8 +68,11 @@ Fallback (sklearn, also hardened with thread caps + free teacher before `fit`):
 python scripts/02_fit_pca_and_encode.py --bundle-dir offline_bundle
 ```
 
-Both scripts write the same artifacts (`pca_384.npz`, `train_mse/`, `eval_mse/`) for `03_train_student.py`.
+Both scripts write the same artifacts (`pca_384.npz`, `train_mse/`, `eval_mse/`, `prompts.json`) for `03_train_student.py`.
+`train_mse` / `eval_mse` include a `prompt_name` column (`sts_query`, `web_search_query`, or `document`) so the student can train with the same Harrier instruction prefixes.
 `02b` also exports `outputs/teacher-pca-384/` (Harrier + PCA as a SentenceTransformer).
+
+If you already have PCA labels **without** `prompt_name`, re-run step 02 (or 02b) to rebuild `train_mse` / `eval_mse` before training.
 
 If you already have `pca_384.npz` and only need the ST export:
 
@@ -77,11 +80,13 @@ If you already have `pca_384.npz` and only need the ST export:
 python scripts/05_export_pca_teacher.py --bundle-dir offline_bundle
 ```
 
-Harrier prompts used while encoding:
+Harrier prompts used while encoding (and later while training/evaluating the student):
 
 - STS / NLI text → `sts_query`
 - Retrieval queries → `web_search_query`
-- Passages / answers → no prompt
+- Passages / answers → no prompt (`document` in MSE datasets)
+
+Prompt strings are written to `artifacts/prompts.json` and attached to the saved student.
 
 Teacher `max_seq_length` defaults to **512** (see `configs/default.yaml`) so PCA targets match the student window.
 
@@ -105,6 +110,7 @@ python scripts/03_train_student.py --bundle-dir offline_bundle
 ```
 
 Saves a standard SentenceTransformer folder at `offline_bundle/outputs/student-final/`.
+Training splits MSE rows by `prompt_name` and applies the matching Harrier prompt string per split (STS eval uses `sts_query`; NanoBEIR uses `web_search_query` for queries and no prompt for documents).
 
 #### TensorBoard
 
@@ -121,11 +127,15 @@ Then open `http://<host>:6006` (SSH tunnel if needed: `ssh -L 6006:localhost:600
 
 Disable with `report_to: none` in `configs/default.yaml`.
 
-Load student later (any machine, no Hub needed):
+Load student later (any machine, no Hub needed). Use the **same** Harrier-style `prompt_name`s at encode time:
 
 ```python
 from sentence_transformers import SentenceTransformer
+
 model = SentenceTransformer("offline_bundle/outputs/student-final/")
+q = model.encode(["what is pca?"], prompt_name="web_search_query")
+s = model.encode(["two similar sentences"], prompt_name="sts_query")
+d = model.encode(["passage text"])  # document: no prompt
 ```
 
 Load PCA teacher (384-d Harrier) for custom eval:

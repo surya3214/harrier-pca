@@ -25,6 +25,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (  # noqa: E402
+    HARRIER_PROMPTS,
+    DOCUMENT_PROMPT_NAME,
     bundle_paths,
     ensure_dirs,
     label_stats,
@@ -60,7 +62,74 @@ def configure_matmul(allow_tf32: bool) -> None:
     logger.info("TF32 matmul=%s cudnn_tf32=%s", allow_tf32, allow_tf32)
 
 
-def build_evaluator(paths: dict, cfg: dict, smoke: bool):
+def load_harrier_prompts(paths: dict) -> dict[str, str]:
+    """Prefer artifacts/prompts.json; fall back to hardcoded HARRIER_PROMPTS."""
+    import json
+
+    prompts_path = paths.get("prompts")
+    if prompts_path is not None and Path(prompts_path).exists():
+        with open(prompts_path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict) and loaded:
+            return {str(k): str(v) for k, v in loaded.items()}
+    return dict(HARRIER_PROMPTS)
+
+
+def split_mse_by_prompt(dataset, *, role: str) -> dict:
+    """Split an MSE dataset into {prompt_name: Dataset} with sentence+label only."""
+    if "prompt_name" not in dataset.column_names:
+        raise SystemExit(
+            f"{role} is missing the prompt_name column. "
+            "Re-run scripts/02b_fit_pca_and_encode_torch.py (or 02_fit_pca_and_encode.py) "
+            "to rebuild train_mse/eval_mse with prompt names."
+        )
+    unique = sorted({(n if n else DOCUMENT_PROMPT_NAME) for n in dataset["prompt_name"]})
+    out: dict = {}
+    for name in unique:
+        subset = dataset.filter(lambda row, n=name: (row["prompt_name"] or DOCUMENT_PROMPT_NAME) == n)
+        drop = [c for c in subset.column_names if c not in ("sentence", "label")]
+        if drop:
+            subset = subset.remove_columns(drop)
+        if len(subset) == 0:
+            continue
+        out[name] = subset
+        logger.info("%s split %r: %s rows", role, name, f"{len(subset):,}")
+    if not out:
+        raise SystemExit(f"{role}: no non-empty prompt splits")
+    return out
+
+
+class _StsPromptEvaluator:
+    """Wrap EmbeddingSimilarityEvaluator to apply sts_query via default_prompt_name.
+
+    EmbeddingSimilarityEvaluator has no prompt= kwarg in current ST versions.
+    """
+
+    def __init__(self, evaluator, prompt_name: str = "sts_query"):
+        self.evaluator = evaluator
+        self.prompt_name = prompt_name
+        self.name = getattr(evaluator, "name", "sts-dev")
+
+    @property
+    def primary_metric(self):
+        return getattr(self.evaluator, "primary_metric", None)
+
+    def __call__(self, model, *args, **kwargs):
+        prev_default = getattr(model, "default_prompt_name", None)
+        # Ensure the prompt dict is present on the model for encode()
+        if self.prompt_name not in getattr(model, "prompts", {}):
+            model.prompts = {**getattr(model, "prompts", {}), **HARRIER_PROMPTS}
+        model.default_prompt_name = self.prompt_name
+        try:
+            return self.evaluator(model, *args, **kwargs)
+        finally:
+            model.default_prompt_name = prev_default
+
+    def __getattr__(self, item):
+        return getattr(self.evaluator, item)
+
+
+def build_evaluator(paths: dict, cfg: dict, smoke: bool, prompts: dict[str, str] | None = None):
     from datasets import load_from_disk
     from sentence_transformers.sentence_transformer.evaluation import (
         EmbeddingSimilarityEvaluator,
@@ -69,18 +138,21 @@ def build_evaluator(paths: dict, cfg: dict, smoke: bool):
     )
     from sentence_transformers.util.similarity import SimilarityFunction
 
+    prompts = prompts or dict(HARRIER_PROMPTS)
+
     stsb = load_from_disk(str(paths["stsb"]))
     val = stsb["validation"] if "validation" in stsb else stsb["train"]
     if smoke:
         val = val.select(range(min(32, len(val))))
 
-    sts_eval = EmbeddingSimilarityEvaluator(
+    sts_inner = EmbeddingSimilarityEvaluator(
         sentences1=list(val["sentence1"]),
         sentences2=list(val["sentence2"]),
         scores=list(val["score"]),
         main_similarity=SimilarityFunction.COSINE,
         name="sts-dev",
     )
+    sts_eval = _StsPromptEvaluator(sts_inner, prompt_name="sts_query")
 
     nanobeir_names = cfg.get("nanobeir_datasets", ["msmarco", "nfcorpus", "nq"])
     if smoke:
@@ -90,6 +162,8 @@ def build_evaluator(paths: dict, cfg: dict, smoke: bool):
         "dataset_names": nanobeir_names,
         "batch_size": 16 if smoke else 128,
         "show_progress_bar": False,
+        "query_prompts": prompts.get("web_search_query", HARRIER_PROMPTS["web_search_query"]),
+        "corpus_prompts": prompts.get("document", ""),
     }
     if paths["nanobeir"].exists():
         nano_kwargs["dataset_id"] = str(paths["nanobeir"])
@@ -125,8 +199,17 @@ def pick_metric(results: dict, sts_eval, nano_eval) -> tuple[str, float]:
     return candidates[0][0], candidates[0][1]
 
 
-def probe_finite_loss(student, loss_fn, dataset, batch_size: int = 8) -> None:
-    """Run a few manual train steps; abort early if loss/grads go non-finite."""
+def probe_finite_loss(
+    student,
+    loss_fn,
+    datasets: dict,
+    prompts: dict[str, str],
+    batch_size: int = 8,
+) -> None:
+    """Run a few manual train steps; abort early if loss/grads go non-finite.
+
+    Tokenizes with the same prompt string the trainer will apply for that split.
+    """
     import torch
 
     student.train()
@@ -136,21 +219,26 @@ def probe_finite_loss(student, loss_fn, dataset, batch_size: int = 8) -> None:
         lr=1e-5,
         weight_decay=0.01,
     )
-    n = min(batch_size * 3, len(dataset))
     metric = getattr(loss_fn, "distance_metric", "mse")
+    names = list(datasets.keys())
 
     for step in range(3):
-        start = step * batch_size
-        end = min(start + batch_size, n)
-        if start >= end:
-            break
-        sentences = [dataset[i]["sentence"] for i in range(start, end)]
+        name = names[step % len(names)]
+        dataset = datasets[name]
+        prompt = prompts.get(name) or None
+        n = min(batch_size, len(dataset))
+        if n == 0:
+            continue
+        sentences = [dataset[i]["sentence"] for i in range(n)]
         labels = torch.tensor(
-            [dataset[i]["label"] for i in range(start, end)],
+            [dataset[i]["label"] for i in range(n)],
             dtype=torch.float32,
             device=device,
         )
-        feats = student.tokenize(sentences)
+        tokenize_kwargs = {}
+        if prompt:
+            tokenize_kwargs["prompt"] = prompt
+        feats = student.tokenize(sentences, **tokenize_kwargs)
         feats = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in feats.items()}
         out = student(feats)["sentence_embedding"]
         teacher = labels.to(device=out.device, dtype=out.dtype)
@@ -164,7 +252,7 @@ def probe_finite_loss(student, loss_fn, dataset, batch_size: int = 8) -> None:
 
         if not torch.isfinite(step_loss):
             raise SystemExit(
-                f"Stability probe failed at step {step}: loss={step_loss}. "
+                f"Stability probe failed at step {step} (split={name!r}): loss={step_loss}. "
                 "Check labels for NaN and keep bf16/TF32 disabled."
             )
         opt.zero_grad(set_to_none=True)
@@ -175,14 +263,17 @@ def probe_finite_loss(student, loss_fn, dataset, batch_size: int = 8) -> None:
         gn = torch.norm(torch.stack([g.detach().float().norm() for g in grads]))
         if not torch.isfinite(gn):
             raise SystemExit(
-                f"Stability probe failed at step {step}: grad_norm={gn}, loss={float(step_loss)}. "
+                f"Stability probe failed at step {step} (split={name!r}): "
+                f"grad_norm={gn}, loss={float(step_loss)}. "
                 "Config should use distance_metric=cosine and normalize_during_training=false."
             )
         torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
         opt.step()
         logger.info(
-            "Stability probe step %s: loss=%.6f grad_norm=%.6f OK",
+            "Stability probe step %s (split=%s prompt=%s): loss=%.6f grad_norm=%.6f OK",
             step,
+            name,
+            "yes" if prompt else "none",
             float(step_loss.detach()),
             float(gn),
         )
@@ -237,6 +328,7 @@ def main() -> None:
     )
     from sentence_transformers.sentence_transformer.losses import EmbedDistillLoss, MSELoss
     from sentence_transformers.sentence_transformer.modules import Normalize
+    from sentence_transformers.sentence_transformer.training_args import MultiDatasetBatchSamplers
 
     allow_tf32 = bool(cfg.get("allow_tf32", False))
     configure_matmul(allow_tf32)
@@ -245,7 +337,10 @@ def main() -> None:
     use_fp16 = bool(cfg.get("fp16", False)) and torch.cuda.is_available() and not use_bf16
     mixed = use_bf16 or use_fp16
 
-    evaluator, sts_eval, nano_eval = build_evaluator(paths, cfg, smoke)
+    harrier_prompts = load_harrier_prompts(paths)
+    logger.info("Using Harrier prompts keys: %s", sorted(harrier_prompts.keys()))
+
+    evaluator, sts_eval, nano_eval = build_evaluator(paths, cfg, smoke, prompts=harrier_prompts)
 
     if args.eval_only:
         logger.info("Eval-only mode: loading %s", args.eval_only)
@@ -294,6 +389,11 @@ def main() -> None:
     elif not normalize_during_training:
         logger.info("Training WITHOUT Normalize module (will append before save)")
 
+    # Persist Harrier prompts on the student for train + save/inference contract
+    student.prompts = dict(harrier_prompts)
+    student.default_prompt_name = None
+    logger.info("Set student.prompts=%s default_prompt_name=None", sorted(student.prompts.keys()))
+
     train_dataset = load_from_disk(str(paths["train_mse"]))
     eval_dataset = load_from_disk(str(paths["eval_mse"]))
     if smoke:
@@ -310,7 +410,20 @@ def main() -> None:
     if len(train_dataset) < before:
         logger.info("Filtered empty train sentences: %s → %s", before, len(train_dataset))
 
-    label0 = train_dataset[0]["label"]
+    train_by_prompt = split_mse_by_prompt(train_dataset, role="train_mse")
+    eval_by_prompt = split_mse_by_prompt(eval_dataset, role="eval_mse")
+
+    # TrainingArguments prompts keys must match dataset dict keys (train + eval)
+    prompt_keys = sorted(set(train_by_prompt) | set(eval_by_prompt))
+    train_prompts = {
+        name: harrier_prompts.get(name, HARRIER_PROMPTS.get(name, ""))
+        for name in prompt_keys
+    }
+    for name, text in train_prompts.items():
+        preview = (text[:48] + "…") if text else "(empty document prompt)"
+        logger.info("Dataset prompt %r → %s", name, preview)
+
+    label0 = next(iter(train_by_prompt.values()))[0]["label"]
     label_dim = len(label0) if isinstance(label0, list) else int(np.asarray(label0).shape[-1])
     student_dim = student.get_embedding_dimension()
     if label_dim != student_dim:
@@ -319,11 +432,16 @@ def main() -> None:
             "Re-run 02b_fit_pca_and_encode_torch.py with matching pca_dim."
         )
 
-    # Full-ish label scan (cap at 50k for speed)
-    scan_n = min(50_000, len(train_dataset))
-    sample_labels = np.asarray(
-        [train_dataset[i]["label"] for i in range(scan_n)], dtype=np.float32
-    )
+    # Full-ish label scan (cap at 50k for speed) across splits
+    scan_n = 0
+    sample_labels_list = []
+    for split_ds in train_by_prompt.values():
+        take = min(len(split_ds), max(1, 50_000 - scan_n))
+        sample_labels_list.extend(split_ds[i]["label"] for i in range(take))
+        scan_n += take
+        if scan_n >= 50_000:
+            break
+    sample_labels = np.asarray(sample_labels_list, dtype=np.float32)
     stats = label_stats(sample_labels)
     logger.info("Label preflight (n=%s): %s", scan_n, stats)
     if not stats["finite"]:
@@ -347,10 +465,13 @@ def main() -> None:
 
     if not args.skip_stability_probe and not smoke:
         logger.info("Running stability probe (3 Adam steps) before full training ...")
-        # Probe on a fresh copy of weights state — actually probe mutates student.
-        # Save state, probe, reload if we want clean start. Simpler: probe then continue
-        # (3 steps of warmup are fine). Or clone. We'll probe then continue from probed weights.
-        probe_finite_loss(student, loss, train_dataset, batch_size=min(8, len(train_dataset)))
+        probe_finite_loss(
+            student,
+            loss,
+            train_by_prompt,
+            train_prompts,
+            batch_size=min(8, min(len(ds) for ds in train_by_prompt.values())),
+        )
 
     baseline_eval = 0.0
     baseline_metric = "skipped"
@@ -434,6 +555,8 @@ def main() -> None:
         remove_unused_columns=False,
         dataloader_drop_last=True,
         optim="adamw_torch",
+        prompts=train_prompts,
+        multi_dataset_batch_sampler=MultiDatasetBatchSamplers.PROPORTIONAL,
     )
     # Prefer frequent early logging: use fraction again for long runs
     if not smoke:
@@ -442,8 +565,8 @@ def main() -> None:
     trainer = SentenceTransformerTrainer(
         model=student,
         args=args_train,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        train_dataset=train_by_prompt,
+        eval_dataset=eval_by_prompt,
         loss=loss,
         evaluator=evaluator,
     )
@@ -453,6 +576,10 @@ def main() -> None:
     if not any(isinstance(m, Normalize) for m in student):
         student.append(Normalize())
         logger.info("Appended Normalize() before save")
+
+    # Re-assert prompts before save (trainer should keep them; belt-and-suspenders)
+    student.prompts = dict(harrier_prompts)
+    student.default_prompt_name = None
 
     logger.info("Student performance after distillation:")
     with autocast_ctx(enabled=mixed):
@@ -496,6 +623,8 @@ def main() -> None:
             "bf16": use_bf16,
             "fp16": use_fp16,
             "student_final": str(final_dir),
+            "prompt_splits": {k: len(v) for k, v in train_by_prompt.items()},
+            "prompts": train_prompts,
         },
     )
 
