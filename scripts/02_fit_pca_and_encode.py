@@ -33,6 +33,7 @@ from common import (  # noqa: E402
     bundle_paths,
     encode_with_prompts,
     ensure_dirs,
+    export_pca_teacher_st,
     l2_normalize,
     load_config,
     resolve_bundle_dir,

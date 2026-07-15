@@ -42,6 +42,7 @@ from common import (  # noqa: E402
     bundle_paths,
     encode_with_prompts,
     ensure_dirs,
+    export_pca_teacher_st,
     l2_normalize,
     load_config,
     resolve_bundle_dir,
@@ -131,6 +132,11 @@ def parse_args() -> argparse.Namespace:
         help="PCA device: cuda|cpu (default: cuda if available else cpu)",
     )
     p.add_argument("--pca-niter", type=int, default=4, help="torch.pca_lowrank power iterations")
+    p.add_argument(
+        "--skip-export-teacher",
+        action="store_true",
+        help="Do not save outputs/teacher-pca-384 SentenceTransformer",
+    )
     return p.parse_args()
 
 
@@ -273,8 +279,20 @@ def main() -> None:
             "device": device,
             "max_seq_length": max_seq_length,
             "teacher_emb_path": str(paths["teacher_emb"]),
+            "teacher_pca_st": str(paths["teacher_pca"]),
         },
     )
+
+    if not args.skip_export_teacher:
+        logger.info("Exporting PCA teacher SentenceTransformer → %s", paths["teacher_pca"])
+        out = export_pca_teacher_st(
+            teacher_path=paths["teacher"],
+            pca_npz_path=paths["pca"],
+            output_path=paths["teacher_pca"],
+            max_seq_length=int(max_seq_length) if max_seq_length is not None else None,
+        )
+        logger.info("Saved PCA teacher ST model to %s (dim=%s)", out, pca_dim)
+
     logger.info("Done. Next: scripts/03_train_student.py")
 
 
