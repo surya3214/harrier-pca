@@ -94,7 +94,15 @@ SMOKE_TEST=1 python scripts/03_train_student.py --bundle-dir offline_bundle   # 
 python scripts/03_train_student.py --bundle-dir offline_bundle
 ```
 
-If training logs `loss≈0.005` then `grad_norm=nan` / `loss=0`, that first loss is healthy (~`2/384` for unit targets); the `0` is usually a hidden NaN (Trainer filters NaN logs). Defaults now use **fp32**, `lr=2e-5`, and `max_grad_norm=1.0`. Re-pull and rerun step 03.
+If training logs `loss≈0.005` then `grad_norm=nan` / `loss=0`, that first loss is healthy (~`2/384` for unit targets); the `0` is usually a hidden NaN (Trainer filters NaN logs).
+
+**Current defaults (anti-NaN):** force **float32** weights on load (this MiniLM checkpoint often loads as fp16, and fp16 Adam without GradScaler NaNs immediately), `distance_metric: cosine`, `normalize_during_training: false`, `bf16/fp16: false`, `allow_tf32: false`, `lr: 1e-5`. A 3-step stability probe aborts if loss/grads are non-finite.
+
+```bash
+python scripts/03_train_student.py --bundle-dir offline_bundle
+# optional: skip heavy pre-train NanoBEIR baseline
+# python scripts/03_train_student.py --bundle-dir offline_bundle --skip-baseline-eval
+```
 
 Saves a standard SentenceTransformer folder at `offline_bundle/outputs/student-final/`.
 

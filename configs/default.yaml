@@ -20,14 +20,20 @@ caps:
 teacher_encode_batch_size: 256
 train_batch_size: 64
 # 1e-4 is fine for already-ST students; raw mMiniLM + Normalize + bf16 NaNs easily
-learning_rate: 2.0e-5
+learning_rate: 1.0e-5
 num_train_epochs: 1
 warmup_steps: 0.1
 max_grad_norm: 1.0
-# fp32 is safer for MSE+Normalize distillation on this student; set true on H100 if stable
+# fp32 only — do not enable bf16/fp16 for this student distill
 bf16: false
 fp16: false
-# Training logs for TensorBoard (view with: tensorboard --logdir offline_bundle/logs/tensorboard)
+# Cosine distill is more stable than MSE through Normalize on raw mMiniLM
+distance_metric: cosine
+# Append Normalize only after training (inference); avoid Normalize grads during train
+normalize_during_training: false
+# TF32 on H100 can destabilize small models; keep false for distill
+allow_tf32: false
+# Training logs for TensorBoard
 report_to: tensorboard
 seed: 12
 
